@@ -1,4 +1,3 @@
-#define _POSIX_C_SOURCE 2
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -8,8 +7,10 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <pthread.h>
 
 #include "server.h"
+#include "thread_info.h"
 
 int main(int argc, char *argv[])
 {
@@ -40,36 +41,51 @@ int main(int argc, char *argv[])
     exit(EXIT_FAILURE);
   }
 
+  // disable SIGHUP for online test
   struct sigaction sa;
   sa.sa_handler = SIG_IGN;
+  sa.sa_flags = SA_RESTART;
   sigfillset(&sa.sa_mask);
   sigaction(SIGHUP, &sa, NULL);
 
-  pid_t pid, sid;
+  demonize(dir);
 
-  /* Fork off the parent process */
-  pid = fork();
-  if (pid < 0) {
-    exit(EXIT_FAILURE);
-  }
-  if (pid > 0) {
-    exit(EXIT_SUCCESS);
-  }
-  umask(0);
-  sid = setsid();
-  if (sid < 0) {
-    exit(EXIT_FAILURE);
-  }
-  /* Change the current working directory */
-  if ((chdir(dir)) < 0) {
-    /* Log any failures here */
-    exit(EXIT_FAILURE);
+  int num_cores = get_num_cores();
+  int worker_sv[num_cores];
+  struct thread_info *tinfo = calloc(num_cores, sizeof(struct thread_info));
+  if (tinfo == NULL) {
+    perror("calloc");
   }
 
-  close(STDIN_FILENO);
-  close(STDOUT_FILENO);
-  close(STDERR_FILENO);
+  for (int i = 0; i < num_cores; ++i)
+  {
+    int sv[2];
+    if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0){
+      perror("socketpair");
+      exit(1);
+    }
+    // if (pipe(sv) == -1) {
+    //     perror("pipe");
+    //     exit(EXIT_FAILURE);
+    // }
+    tinfo[i].thread_num = i;
+    tinfo[i].pipe_socket = sv[0];
+    // printf("create thread %d pipe %d\n", tinfo[i].thread_num, tinfo[i].pipe_socket);
+    int result=pthread_create(&tinfo[i].thread_id, NULL, thread_worker, &tinfo[i]);
+    if(result != 0) {
+      perror("pthread_create");
+      exit(1);
+    }
+    worker_sv[i] = sv[1];
+  }
 
-  server(port, ip);
+  server(port, ip, worker_sv, num_cores);
+
+  for (int i = 0; i < num_cores; ++i)
+  {
+    int status_addr;
+    pthread_join(tinfo[i].thread_id, (void**)&status_addr);
+  }
+  free(tinfo);
   return EXIT_SUCCESS;
 }
